@@ -49,11 +49,55 @@ console.log(
   `运行时间限制为：${runTimeLimitMinutes} 分钟 (${runTimeLimitMillis} 毫秒)`
 );
 
+// 全局追踪所有当前活跃的浏览器实例，shutdown 时回写 cookie
+const activeItems = [];
+
+async function persistAllCookies() {
+  for (const it of activeItems) {
+    if (!it.cookieFile || !it.page) continue;
+    try {
+      const cookies = await it.page.cookies(it.loginUrl || "https://linux.do");
+      fs.mkdirSync(path.dirname(it.cookieFile), { recursive: true });
+      fs.writeFileSync(it.cookieFile, JSON.stringify(cookies, null, 2));
+      console.log(`💾 ${it.username}: 保存 ${cookies.length} 个 cookie -> ${it.cookieFile}`);
+    } catch (e) {
+      console.log(`⚠️ ${it.username}: cookie 保存失败 ${e.message}`);
+    }
+  }
+}
+
+async function closeAllBrowsers() {
+  for (const it of activeItems) {
+    try {
+      // 拿到 chrome 子进程 pid，关不掉就 SIGKILL 兜底
+      const proc = it.browser && it.browser.process && it.browser.process();
+      const pid = proc && proc.pid;
+      await Promise.race([
+        it.browser.close(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("close timeout")), 8000)),
+      ]).catch(() => {});
+      if (pid) {
+        try { process.kill(-pid, "SIGKILL"); } catch {}
+        try { process.kill(pid, "SIGKILL"); } catch {}
+      }
+    } catch {}
+  }
+}
+
+let shuttingDown = false;
+async function gracefulShutdown(reason) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`关闭中 (${reason})...`);
+  await persistAllCookies();
+  await closeAllBrowsers();
+  process.exit(0);
+}
+
 // 设置一个定时器，在运行时间到达时终止进程
-const shutdownTimer = setTimeout(() => {
-  console.log("时间到,Reached time limit, shutting down the process...");
-  process.exit(0); // 退出进程
-}, runTimeLimitMillis);
+const shutdownTimer = setTimeout(() => gracefulShutdown("time limit"), runTimeLimitMillis);
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 const chatId = process.env.TELEGRAM_CHAT_ID;
@@ -206,11 +250,9 @@ function delayClick(time) {
       // 执行每批次最多 4 个账号
       const batch = loginTasks
         .slice(i, i + maxConcurrentAccounts)
-        .map(async (task) => {
-          const { browser } = await task(); // 运行任务并获取浏览器实例
-          return browser;
-        }); // 等待当前批次的任务完成
-      const browsers = await Promise.all(batch); // Task里面的任务本身是没有进行await的, 所以会继续执行下面的代码
+        .map(async (task) => task());
+      const items = await Promise.all(batch);
+      const browsers = items.map((it) => it.browser);
 
       // 如果还有下一个批次，等待指定的时间,同时，如果总共只有一个账号，也需要继续运行
       if (i + maxConcurrentAccounts < totalAccounts || i === 0) {
@@ -226,7 +268,19 @@ function delayClick(time) {
           Math.floor(i / maxConcurrentAccounts) + 1
         } 完成，关闭浏览器...,浏览器对象：${browsers}`
       );
-      // 关闭所有浏览器实例
+      // 关闭前先回写 cookie（每天保鲜）
+      for (const it of items) {
+        if (it.cookieFile && it.page) {
+          try {
+            const cookies = await it.page.cookies(loginUrl);
+            fs.mkdirSync(path.dirname(it.cookieFile), { recursive: true });
+            fs.writeFileSync(it.cookieFile, JSON.stringify(cookies, null, 2));
+            console.log(`💾 ${it.username}: 保存 ${cookies.length} 个 cookie -> ${it.cookieFile}`);
+          } catch (e) {
+            console.log(`⚠️ ${it.username}: cookie 保存失败 ${e.message}`);
+          }
+        }
+      }
       for (const browser of browsers) {
         await browser.close();
       }
@@ -245,11 +299,20 @@ function delayClick(time) {
 })();
 async function launchBrowserForUser(username, password) {
   let browser = null; // 在 try 之外声明 browser 变量
+  let page = null;
+  let cookieFile = null;
   try {
     console.log("当前用户:", username);
+    const profileDir = path.resolve(
+      dirname(fileURLToPath(import.meta.url)),
+      "profiles",
+      username.replace(/[^a-zA-Z0-9._-]/g, "_")
+    );
+    fs.mkdirSync(profileDir, { recursive: true });
     const browserOptions = {
       headless: "auto",
-      args: ["--no-sandbox", "--disable-setuid-sandbox"], // Linux 需要的安全设置
+      args: ["--no-sandbox", "--disable-setuid-sandbox"],
+      customConfig: { userDataDir: profileDir },
     };
 
     // 添加代理配置到浏览器选项
@@ -273,8 +336,45 @@ async function launchBrowserForUser(username, password) {
     }
 
     var { connect } = await import("puppeteer-real-browser");
-    const { page, browser: newBrowser } = await connect(browserOptions);
-    browser = newBrowser; // 将 browser 初始化
+    const connected = await connect(browserOptions);
+    page = connected.page;
+    browser = connected.browser;
+
+    // 注入本地浏览器导出的 cookie（首次 hCaptcha 已在本地过过，后续保鲜靠每天跑）
+    cookieFile = path.resolve(
+      dirname(fileURLToPath(import.meta.url)),
+      "cookies",
+      `${username.replace(/[^a-zA-Z0-9._-]/g, "_")}.json`
+    );
+    if (fs.existsSync(cookieFile)) {
+      try {
+        const raw = JSON.parse(fs.readFileSync(cookieFile, "utf8"));
+        const normalized = raw.map((c) => {
+          const out = {
+            name: c.name,
+            value: c.value,
+            domain: c.domain,
+            path: c.path || "/",
+            secure: !!c.secure,
+            httpOnly: !!c.httpOnly,
+          };
+          if (c.expirationDate) out.expires = Math.floor(c.expirationDate);
+          if (c.expires && !out.expires) out.expires = Math.floor(c.expires);
+          if (c.sameSite) {
+            const s = c.sameSite.toLowerCase();
+            out.sameSite = s === "no_restriction" || s === "none" ? "None" :
+                           s === "strict" ? "Strict" : "Lax";
+          }
+          return out;
+        });
+        await page.setCookie(...normalized);
+        console.log(`✅ 注入 ${normalized.length} 个 cookie (from ${cookieFile})`);
+      } catch (e) {
+        console.log(`⚠️ cookie 文件解析失败 ${cookieFile}: ${e.message}`);
+      }
+    } else {
+      console.log(`ℹ️ 未找到 ${cookieFile}，将走完整登录流程（会被 hCaptcha 卡住）`);
+    }
     // 启动截图功能
     // takeScreenshots(page);
     //登录操作
@@ -327,16 +427,20 @@ async function launchBrowserForUser(username, password) {
       }
     });
     // //登录操作
-    console.log("登录操作");
-    await login(page, username, password);
-    // 查找具有类名 "avatar" 的 img 元素验证登录是否成功
-    const avatarImg = await page.$("img.avatar");
-
-    if (avatarImg) {
-      console.log("找到avatarImg，登录成功");
+    const loggedInSel = "header .current-user, header #current-user, .header-dropdown-toggle.current-user";
+    let alreadyLoggedIn = await page.$(loggedInSel);
+    if (alreadyLoggedIn) {
+      console.log(`用户 ${username} 已有持久化会话，跳过登录`);
     } else {
-      console.log("未找到avatarImg，登录失败");
-      throw new Error("登录失败");
+      console.log("登录操作");
+      await login(page, username, password);
+      const avatarImg = await page.$(loggedInSel);
+      if (avatarImg) {
+        console.log("登录成功");
+      } else {
+        console.log("登录失败");
+        throw new Error("登录失败");
+      }
     }
 
     //真正执行阅读脚本
@@ -452,56 +556,26 @@ async function launchBrowserForUser(username, password) {
         await new Promise((r) => setTimeout(r, 500));
       });
     }
-    return { browser };
+    const result = { browser, page, cookieFile, username, loginUrl };
+    activeItems.push(result);
+    return result;
   } catch (err) {
     // throw new Error(err);
     console.log("Error in launchBrowserForUser:", err);
     if (token && chatId) {
       sendToTelegram(`${err.message}`);
     }
-    return { browser }; // 错误时仍然返回 browser
+    const result = { browser, page, cookieFile, username, loginUrl };
+    activeItems.push(result);
+    return result; // 错误时仍然返回 browser
   }
 }
 async function login(page, username, password, retryCount = 3) {
   // 使用XPath查询找到包含"登录"或"login"文本的按钮
-  let loginButtonFound = await page.evaluate(() => {
-    let loginButton = Array.from(document.querySelectorAll("button")).find(
-      (button) =>
-        button.textContent.includes("登录") ||
-        button.textContent.includes("login")
-    ); // 注意loginButton 变量在外部作用域中是无法被 page.evaluate 内部的代码直接修改的。page.evaluate 的代码是在浏览器环境中执行的，这意味着它们无法直接影响 Node.js 环境中的变量
-    // 如果没有找到，尝试根据类名查找
-    if (!loginButton) {
-      loginButton = document.querySelector(".login-button");
-    }
-    if (loginButton) {
-      loginButton.click();
-      console.log("Login button clicked.");
-      return true; // 返回true表示找到了按钮并点击了
-    } else {
-      console.log("Login button not found.");
-      return false; // 返回false表示没有找到按钮
-    }
-  });
-  if (!loginButtonFound) {
-    if (loginUrl == "https://meta.appinn.net") {
-      await page.goto("https://meta.appinn.net/t/topic/52006", {
-        waitUntil: "domcontentloaded",
-      });
-      await page.click(".discourse-reactions-reaction-button");
-    } else {
-      await page.goto(`${loginUrl}/t/topic/1`, {
-        waitUntil: "domcontentloaded",
-      });
-      try {
-        await page.click(".discourse-reactions-reaction-button");
-      } catch (error) {
-        console.log("没有找到点赞按钮，可能是页面没有加载完成或按钮不存在");
-      }
-    }
-  }
-  // 等待用户名输入框加载
-  await page.waitForSelector("#login-account-name");
+  // 直接 full page navigate 到 /login，避开 Ember 客户端路由的重渲染竞争
+  await page.goto(`${loginUrl}/login`, { waitUntil: "domcontentloaded", timeout: 60000 });
+  await delayClick(2000);
+  await page.waitForSelector("#login-account-name", { timeout: 30000 });
   // 模拟人类在找到输入框后的短暂停顿
   await delayClick(1000); // 延迟500毫秒
   // 清空输入框并输入用户名
@@ -528,7 +602,7 @@ async function login(page, username, password, retryCount = 3) {
   await page.click("#login-button");
   try {
     await Promise.all([
-      page.waitForNavigation({ waitUntil: "domcontentloaded" }), // 等待 页面跳转 DOMContentLoaded 事件
+      page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 120000 }), // 给 NopeCHA 解 hCaptcha 留 2 分钟
       // 去掉上面一行会报错：Error: Execution context was destroyed, most likely because of a navigation. 可能是因为之后没等页面加载完成就执行了脚本
       page.click("#login-button", { force: true }), // 点击登录按钮触发跳转
     ]); //注意如果登录失败，这里会一直等待跳转，导致脚本执行失败 这点四个月之前你就发现了结果今天又遇到（有个用户遇到了https://linux.do/t/topic/169209/82），但是你没有在这个报错你提示我8.5
@@ -550,6 +624,21 @@ async function login(page, username, password, retryCount = 3) {
         );
       }
     } else {
+      try {
+        const shotPath = `/tmp/login_fail_${username}_${retryCount}.png`;
+        await page.screenshot({ path: shotPath, fullPage: true });
+        const curUrl = page.url();
+        const hasCaptchaIframe = await page.evaluate(
+          () => !!document.querySelector("iframe[src*='hcaptcha']")
+        );
+        const hasCaptchaResp = await page.evaluate(
+          () => document.querySelector("[name='h-captcha-response']")?.value?.length || 0
+        );
+        console.log(`[debug] url=${curUrl} hcaptcha_iframe=${hasCaptchaIframe} captcha_token_len=${hasCaptchaResp}`);
+        console.log(`[debug] screenshot saved: ${shotPath}`);
+      } catch (e) {
+        console.log("[debug] screenshot failed:", e.message);
+      }
       if (retryCount > 0) {
         console.log("Retrying login...");
         await page.reload({ waitUntil: "domcontentloaded" });

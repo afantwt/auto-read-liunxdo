@@ -2,3 +2,8 @@ node_modules/
 .env.local*
 screenshots
 .env
+# 本地 session 数据，含登录态——绝不入库
+cookies/
+profiles/
+# 运行日志
+cron.log
